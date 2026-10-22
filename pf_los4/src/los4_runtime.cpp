@@ -18,7 +18,7 @@ int rc_mode(const std::string& mode) {
 double Runtime::time() const {return std::chrono::duration<double>(Clock::now()-epoch).count();}
 Runtime::Runtime(Config config,std::shared_ptr<mavsdk::System> system):c(std::move(config)),controller(c),safety(c),previous(safety.phase) {
     std::cout<<"LOS4 "<<name(safety.phase)<<" path="<<c.path<<" rc-channel="<<c.rc_channel
-             <<" return-mode="<<(c.return_mode.empty()?"UNSET":c.return_mode)<<"\n";
+             <<" wind="<<std::boolalpha<<c.wind<<" return-mode="<<(c.return_mode.empty()?"UNSET":c.return_mode)<<"\n";
     if(c.bench_offboard)std::cout<<"BENCH OFFBOARD: no airborne/speed requirement; zero thrust and rates, gamma frozen."
         << (c.test ? " Gamma-test flag overrides bench: no control packets." : "") << "\n";
     if(!system)return;
@@ -59,6 +59,27 @@ Runtime::Runtime(Config config,std::shared_ptr<mavsdk::System> system):c(std::mo
             d.kill_valid=k<=v.chancount && kill_pwm>=800 && kill_pwm<=2200 && v.rssi!=0;
             d.kill=!d.kill_valid || (config_copy.kill_active_high ?
                 kill_pwm>=config_copy.kill_threshold : kill_pwm<=config_copy.kill_threshold);
+        } else if(m.msgid==MAVLINK_MSG_ID_VFR_HUD) {
+            mavlink_vfr_hud_t v{};mavlink_msg_vfr_hud_decode(&m,&v);
+            d.air_data.calibrated=v.airspeed;d.air_data.air_time=t;
+        } else if(m.msgid==MAVLINK_MSG_ID_HIGHRES_IMU) {
+            mavlink_highres_imu_t v{};mavlink_msg_highres_imu_decode(&m,&v);
+            // Only refreshed pressure/ambient-temperature fields count as fresh.
+            if((v.fields_updated & (1<<9)) && (v.fields_updated & (1<<12))) {
+                d.air_data.pressure_pa=v.abs_pressure*100.0;d.air_data.temperature_c=v.temperature;
+                d.air_data.pressure_time=t;
+            }
+        } else if(m.msgid==MAVLINK_MSG_ID_SYS_STATUS) {
+            mavlink_sys_status_t v{};mavlink_msg_sys_status_decode(&m,&v);
+            constexpr uint32_t bit=MAV_SYS_STATUS_SENSOR_DIFFERENTIAL_PRESSURE;
+            d.air_data.sensor_healthy=(v.onboard_control_sensors_present & bit) &&
+                (v.onboard_control_sensors_enabled & bit) && (v.onboard_control_sensors_health & bit);
+            d.air_data.health_time=t;
+        } else if(m.msgid==MAVLINK_MSG_ID_WIND_COV) {
+            mavlink_wind_cov_t v{};mavlink_msg_wind_cov_decode(&m,&v);
+            d.air_data.wind={v.wind_x,v.wind_y};d.air_data.wind_time=t;
+            // PX4 publishes the sum of the two horizontal estimator variances.
+            d.air_data.wind_estimated=std::isfinite(v.var_horiz) && v.var_horiz>0;
         } else if(m.msgid==MAVLINK_MSG_ID_COMMAND_ACK) {
             mavlink_command_ack_t v{};mavlink_msg_command_ack_decode(&m,&v);
             if(v.command==MAV_CMD_DO_SET_MODE &&
@@ -66,12 +87,15 @@ Runtime::Runtime(Config config,std::shared_ptr<mavsdk::System> system):c(std::mo
         }
     };
     for(const uint16_t id : {MAVLINK_MSG_ID_HEARTBEAT,MAVLINK_MSG_ID_EXTENDED_SYS_STATE,
-        MAVLINK_MSG_ID_LOCAL_POSITION_NED,MAVLINK_MSG_ID_ATTITUDE,MAVLINK_MSG_ID_RC_CHANNELS,MAVLINK_MSG_ID_COMMAND_ACK})
+        MAVLINK_MSG_ID_LOCAL_POSITION_NED,MAVLINK_MSG_ID_ATTITUDE,MAVLINK_MSG_ID_RC_CHANNELS,MAVLINK_MSG_ID_COMMAND_ACK,
+        MAVLINK_MSG_ID_VFR_HUD,MAVLINK_MSG_ID_HIGHRES_IMU,MAVLINK_MSG_ID_SYS_STATUS,MAVLINK_MSG_ID_WIND_COV})
         handles.emplace_back(id,link->subscribe_message(id,callback));
     // Request safety streams once; no arm/takeoff command exists in this program.
     for(const auto& pair : {std::pair<int,double>{MAVLINK_MSG_ID_EXTENDED_SYS_STATE,5},
                           {MAVLINK_MSG_ID_RC_CHANNELS,10},{MAVLINK_MSG_ID_LOCAL_POSITION_NED,20},
-                          {MAVLINK_MSG_ID_ATTITUDE,20}}) {
+                          {MAVLINK_MSG_ID_ATTITUDE,20},{MAVLINK_MSG_ID_VFR_HUD,10},
+                          {MAVLINK_MSG_ID_HIGHRES_IMU,10},{MAVLINK_MSG_ID_SYS_STATUS,2},
+                          {MAVLINK_MSG_ID_WIND_COV,5}}) {
         link->queue_message([pair,target_sys,target_comp](auto address,uint8_t channel) {
             mavlink_message_t msg{};
             mavlink_msg_command_long_pack_chan(address.system_id,address.component_id,channel,&msg,
@@ -140,6 +164,17 @@ void Runtime::diagnostics(double t) {
               float(c.radius),float(c.scale),float(c.speed)});
     }
     Data d;{std::lock_guard<std::mutex> lock(cache->mutex);d=cache->data;}
+    const bool air_valid=d.air_data.air_valid(t),wind_valid=d.air_data.wind_valid(t);
+    int compensation=0;
+    if(c.wind && wind_valid) {
+        const auto point=path_point(c,have_output?latest.gamma:c.gamma0);
+        const double acceleration=wind_curvature_acceleration(1.0,point.d1.head<2>().normalized(),
+            d.v.head<2>(),c.speed,d.air_data.wind);
+        compensation=std::isfinite(acceleration)?1:2;
+    }
+    send({1,3,float(c.wind),float(air_valid?d.air_data.true_airspeed():NAN),
+          float(d.air_data.calibrated),float(d.air_data.wind.x()),float(d.air_data.wind.y()),
+          float(d.air_data.air_age(t)),float(t-d.air_data.wind_time),float(air_valid),float(wind_valid),float(compensation)});
     Output output=latest;
     if(!have_output) {
         output.gamma=c.gamma0;const auto point=path_point(c,c.gamma0);
@@ -154,7 +189,8 @@ void Runtime::diagnostics(double t) {
         // Shadow desired attitude at the test gamma; never transmit setpoints.
         try {
             auto config=c;config.gamma0=output.gamma;Los4 shadow(config);
-            const auto preview=shadow.step(1/c.rate,d.p,d.v,d.eta);
+            const auto preview=shadow.step(1/c.rate,d.p,d.v,d.eta,
+                d.air_data.air_valid(t)?d.air_data.true_airspeed():NAN,d.air_data.wind,d.air_data.wind_valid(t));
             output.roll=preview.roll;output.pitch=preview.pitch;output.heading=preview.heading;flags|=8;
         } catch(const std::exception&) {} // No reference if speed/geometry is unsuitable.
     }
@@ -179,7 +215,7 @@ void Runtime::tick() {
         SafetyInput in;
         in.offboard=d.mode==6;
         in.ready=heartbeat_fresh && attitude_fresh && d.px4 && d.fixed_wing && d.armed &&
-                 (c.bench_offboard || flight_ready) && (in.offboard || d.mode==1);
+                 (c.bench_offboard || (flight_ready && (!c.wind || d.air_data.air_valid(t)))) && (in.offboard || d.mode==1);
         in.switch_valid=d.rc_valid && d.kill_valid && t-d.rc_time<c.stale;
         in.kill=d.kill;in.manual=d.mode==1;
         in.switch_on=d.rc_on;in.switch_off=d.rc_off;
@@ -196,8 +232,8 @@ void Runtime::tick() {
                     latest=Output{};latest.gamma=c.gamma0;
                     const auto point=path_point(c,c.gamma0);
                     latest.pd=point.p;latest.derivative=point.d1;
-                } else if(safety.phase==Phase::Active)latest=controller.step(dt,d.p,d.v,d.eta);
-                else {auto preview=controller;latest=preview.step(1/c.rate,d.p,d.v,d.eta);latest.gamma_dot=0;}
+                } else if(safety.phase==Phase::Active)latest=controller.step(dt,d.p,d.v,d.eta,d.air_data.true_airspeed(),d.air_data.wind,d.air_data.wind_valid(t));
+                else {auto preview=controller;latest=preview.step(1/c.rate,d.p,d.v,d.eta,d.air_data.true_airspeed(),d.air_data.wind,d.air_data.wind_valid(t));latest.gamma_dot=0;}
                 have_output=true;
                 if(!send_setpoint(latest))throw std::runtime_error("Setpoint could not be queued");
             }
@@ -222,6 +258,12 @@ void Runtime::tick() {
         last_print=t;std::cout<<std::fixed<<std::setprecision(4)<<"LOS4 state="<<(c.bench_offboard && safety.phase==Phase::Active ? "BENCH_OFFBOARD_ACTIVE" : name(safety.phase));
         if(have_output)std::cout<<" path="<<c.path<<" gamma="<<latest.gamma<<" gamma_dot="<<latest.gamma_dot
             <<" pd_NED=["<<latest.pd.transpose()<<"] ep_norm="<<latest.ep_norm;
+        if(c.wind) {
+            Data d;{std::lock_guard<std::mutex> lock(cache->mutex);d=cache->data;}
+            std::cout<<" TAS="<<(d.air_data.air_valid(t)?d.air_data.true_airspeed():NAN)
+                     <<" airspeed_valid="<<d.air_data.air_valid(t)<<" wind_valid="<<d.air_data.wind_valid(t)
+                     <<" wind_NE=["<<d.air_data.wind.transpose()<<"]";
+        }
         std::cout<<"\n";
     }
 }

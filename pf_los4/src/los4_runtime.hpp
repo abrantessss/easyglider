@@ -1,5 +1,6 @@
 #pragma once
 #include "los4_core.hpp"
+#include "los4_air_data.hpp"
 #include "los4_safety.hpp"
 #include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.h>
 #include <chrono>
@@ -12,6 +13,7 @@ class Runtime {
     struct Data {
         bool hb=false,armed=false,air=false,px4=false,fixed_wing=false,rc_valid=false,rc_on=false,rc_off=false;
         bool rejected=false,kill=true,kill_valid=false;
+        AirData air_data;
         int mode=0;
         double hb_time=-100,air_time=-100,rc_time=-100,p_time=-100,a_time=-100;
         Eigen::Vector3d p=Eigen::Vector3d::Zero(),v=Eigen::Vector3d::Zero(),eta=Eigen::Vector3d::Zero();

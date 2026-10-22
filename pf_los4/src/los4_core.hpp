@@ -2,6 +2,7 @@
 #include "los4_config.hpp"
 #include <Eigen/Geometry>
 #include <algorithm>
+#include <limits>
 
 namespace pf {
 struct PathPoint { Eigen::Vector3d p,d1,d2; };
@@ -17,9 +18,22 @@ struct Output {
     Eigen::Vector3d pd=Eigen::Vector3d::Zero(), derivative=Eigen::Vector3d::Zero(),
                     ep=Eigen::Vector3d::Zero(), body_rates=Eigen::Vector3d::Zero();
 };
+// Same steady horizontal wind-triangle feedforward as LOS4WindController.
+inline double wind_curvature_acceleration(double curvature,const Eigen::Vector2d& tangent,
+    const Eigen::Vector2d& ground_velocity,double reference_airspeed,const Eigen::Vector2d& wind) {
+    const double cross=tangent.x()*wind.y()-tangent.y()*wind.x();
+    const double projected_sq=reference_airspeed*reference_airspeed-cross*cross;
+    if(!std::isfinite(reference_airspeed) || reference_airspeed<=0 || projected_sq<=1e-6)
+        return std::numeric_limits<double>::quiet_NaN();
+    const double projected=std::sqrt(projected_sq),ground=projected+wind.dot(tangent);
+    if(ground<=0)return std::numeric_limits<double>::quiet_NaN();
+    return reference_airspeed*(ground/projected)*curvature*std::max(ground_velocity.dot(tangent),0.0);
+}
 class Los4 {
     Config c;
     double gamma=0,zref=0,ei=0,bi=0,previous_roll=0,previous_pitch=0;
+    double filtered_roll_derivative=0,filtered_pitch_derivative=0;
+    static constexpr double derivative_tau=0.5; // seconds
     bool initialized=false;
     static double pi(double e,double dt,double& integral,double kp,double ki,double lo,double hi) {
         const double candidate=integral+e*dt, raw=kp*e+ki*candidate;
@@ -28,17 +42,22 @@ class Los4 {
     }
 public:
     explicit Los4(Config config):c(std::move(config)),gamma(c.gamma0) {}
-    void reset() { gamma=c.gamma0; zref=ei=bi=previous_roll=previous_pitch=0; initialized=false; }
+    void reset() { gamma=c.gamma0; zref=ei=bi=previous_roll=previous_pitch=0;
+        filtered_roll_derivative=filtered_pitch_derivative=0; initialized=false; }
     Output test_step(double dt) {
         if(!std::isfinite(dt) || dt<=0) throw std::runtime_error("Invalid timestep");
         Output out;const auto point=path_point(c,gamma);
         out.gamma=gamma;out.gamma_dot=1;out.pd=point.p;out.derivative=point.d1;gamma+=dt;
         return out;
     }
-    Output step(double dt,const Eigen::Vector3d& p,const Eigen::Vector3d& v,const Eigen::Vector3d& eta) {
+    Output step(double dt,const Eigen::Vector3d& p,const Eigen::Vector3d& v,const Eigen::Vector3d& eta,
+        double true_airspeed=std::numeric_limits<double>::quiet_NaN(),
+        const Eigen::Vector2d& wind=Eigen::Vector2d::Zero(),bool wind_valid=false) {
         if(!std::isfinite(dt) || dt<=0 || dt>0.1 || !p.allFinite() || !v.allFinite() || !eta.allFinite())
             throw std::runtime_error("Invalid or nonfinite control input/timestep");
         if(v.head<2>().norm()<c.min_speed) throw std::runtime_error("Horizontal speed below controller minimum");
+        if(c.wind && (!std::isfinite(true_airspeed) || true_airspeed<0))
+            throw std::runtime_error("Wind control requires valid true airspeed");
         Output out; const auto point=path_point(c,gamma);
         out.gamma=gamma;out.pd=point.p;out.derivative=point.d1;out.ep=p-point.p;out.ep_norm=out.ep.norm();
         const auto tangent=(point.d1/point.d1.norm()).eval();
@@ -49,7 +68,7 @@ public:
         const double hdot=-c.speed*h.z();
         if(!initialized) zref=-p.z();
         zref+=hdot*dt;
-        const double kinetic=0.5*c.mass*(c.speed*c.speed-v.squaredNorm());
+        const double kinetic=0.5*c.mass*(c.speed*c.speed-(c.wind ? true_airspeed*true_airspeed : v.squaredNorm()));
         const double potential=c.mass*9.81*(-p.z()-zref), energy=potential+kinetic,balance=kinetic-potential;
         const double candidate=ei+energy*dt;
         const double raw=(c.kiE*candidate+(c.mass*9.81*hdot-c.kpE*energy)/c.speed)/c.tmax;
@@ -64,11 +83,22 @@ public:
         const double ez=(v.x()*h.y()-v.y()*h.x())/(v.head<2>().norm()*hnorm);
         const double curvature=(point.d1.x()*point.d2.y()-point.d1.y()*point.d2.x())/
                                std::pow(point.d1.head<2>().squaredNorm(),1.5);
-        out.roll=std::atan(std::clamp(c.speed*c.speed*curvature+c.ka*ez,c.accel_min,c.accel_max)/9.81);
+        double curvature_acceleration=c.speed*c.speed*curvature;
+        if(c.wind && wind_valid) {
+            if(!wind.allFinite())throw std::runtime_error("Nonfinite wind estimate");
+            curvature_acceleration=wind_curvature_acceleration(curvature,point.d1.head<2>().normalized(),
+                v.head<2>(),c.speed,wind);
+            if(!std::isfinite(curvature_acceleration))curvature_acceleration=0;
+        }
+        out.roll=std::atan(std::clamp(curvature_acceleration+c.ka*ez,c.accel_min,c.accel_max)/9.81);
         if(!initialized) {previous_roll=out.roll;previous_pitch=out.pitch;initialized=true;}
-        const double rd=(out.roll-previous_roll)/dt+c.kphi*(out.roll-eta.x());
-        const double pd=(out.pitch-previous_pitch)/dt+c.ktheta*(out.pitch-eta.y());
-        const double yd=9.81*std::tan(out.roll)/(c.speed*std::cos(out.pitch));
+        // Backward-Euler low-pass filter on derivative feedforward only.
+        const double alpha=dt/(derivative_tau+dt);
+        filtered_roll_derivative+=alpha*((out.roll-previous_roll)/dt-filtered_roll_derivative);
+        filtered_pitch_derivative+=alpha*((out.pitch-previous_pitch)/dt-filtered_pitch_derivative);
+        const double rd=filtered_roll_derivative+c.kphi*(out.roll-eta.x());
+        const double pd=filtered_pitch_derivative+c.ktheta*(out.pitch-eta.y());
+        const double yd=9.81*std::tan(out.roll)/c.speed;
         previous_roll=out.roll;previous_pitch=out.pitch;
         out.body_rates={rd-yd*std::sin(eta.y()),pd*std::cos(eta.x())+yd*std::sin(eta.x())*std::cos(eta.y()),
                         -pd*std::sin(eta.x())+yd*std::cos(eta.x())*std::cos(eta.y())};

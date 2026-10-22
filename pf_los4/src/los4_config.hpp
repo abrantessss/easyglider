@@ -9,13 +9,13 @@ namespace pf {
 struct Config {
     std::string path="circle", return_mode="manual", throttle_model="quadratic";
     bool enabled=false, test=true, offline=true;
-    bool bench_offboard=false;
+    bool bench_offboard=false, wind=false;
     // rc_off is retained for old CLI compatibility; low/mid is <rc_on.
     int rc_channel=7, rc_on=1700, rc_off=1300;
     int kill_channel=6, kill_threshold=1700;
     bool kill_active_high=true;
-    double radius=50, scale=50, speed=22, gamma0=0, rate=50, stale=0.5;
-    Eigen::Vector3d p0{0,0,-30}, p1{200,0,-30}, center{0,0,-30};
+    double radius=150, scale=200, speed=20, gamma0=0, rate=50, stale=0.5;
+    Eigen::Vector3d p0{0,0,-30}, p1{200,0,-30}, center{0,0,-25};
     double mass=1.48, tmax=104.720105;
     double k1=1, k2=20, kpE=0.05, kiE=0.005, kpB=0.002, kiB=0.00001;
     double ka=10, kphi=10, ktheta=10;
@@ -42,6 +42,7 @@ inline bool boolean(const std::string& s) {
 inline void option(Config& c,const std::string& key,const std::string& v) {
     if(key=="path") c.path=v;
     else if(key=="controller-enabled") c.enabled=boolean(v);
+    else if(key=="wind") c.wind=boolean(v);
     else if(key=="bench-offboard") c.bench_offboard=boolean(v);
     else if(key=="kill-active-high") c.kill_active_high=boolean(v);
     else if(key=="test-gamma") c.test=boolean(v);
