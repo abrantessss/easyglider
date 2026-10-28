@@ -51,13 +51,13 @@ public:
         return out;
     }
     Output step(double dt,const Eigen::Vector3d& p,const Eigen::Vector3d& v,const Eigen::Vector3d& eta,
-        double true_airspeed=std::numeric_limits<double>::quiet_NaN(),
+        double calibrated_airspeed=std::numeric_limits<double>::quiet_NaN(),
         const Eigen::Vector2d& wind=Eigen::Vector2d::Zero(),bool wind_valid=false) {
         if(!std::isfinite(dt) || dt<=0 || dt>0.1 || !p.allFinite() || !v.allFinite() || !eta.allFinite())
             throw std::runtime_error("Invalid or nonfinite control input/timestep");
         if(v.head<2>().norm()<c.min_speed) throw std::runtime_error("Horizontal speed below controller minimum");
-        if(c.wind && (!std::isfinite(true_airspeed) || true_airspeed<0))
-            throw std::runtime_error("Wind control requires valid true airspeed");
+        if(c.wind && (!std::isfinite(calibrated_airspeed) || calibrated_airspeed<0))
+            throw std::runtime_error("Wind control requires valid calibrated airspeed");
         Output out; const auto point=path_point(c,gamma);
         out.gamma=gamma;out.pd=point.p;out.derivative=point.d1;out.ep=p-point.p;out.ep_norm=out.ep.norm();
         const auto tangent=(point.d1/point.d1.norm()).eval();
@@ -68,14 +68,20 @@ public:
         const double hdot=-c.speed*h.z();
         if(!initialized) zref=-p.z();
         zref+=hdot*dt;
-        const double kinetic=0.5*c.mass*(c.speed*c.speed-(c.wind ? true_airspeed*true_airspeed : v.squaredNorm()));
+        // Actual minus desired, matching VioLET LOS4 energy control.
+        const double kinetic=0.5*c.mass*((c.wind ? calibrated_airspeed*calibrated_airspeed : v.squaredNorm())-c.speed*c.speed);
         const double potential=c.mass*9.81*(-p.z()-zref), energy=potential+kinetic,balance=kinetic-potential;
         const double candidate=ei+energy*dt;
-        const double raw=(c.kiE*candidate+(c.mass*9.81*hdot-c.kpE*energy)/c.speed)/c.tmax;
+        const auto thrust_fraction=[&](double integral) {
+            return ((c.mass*9.81*hdot-c.kpE*energy)/c.speed-c.kiE*integral)/c.tmax;
+        };
+        const double raw=thrust_fraction(candidate);
         const double lo=c.throttle_model=="quadratic" ? c.throttle_min*c.throttle_min : c.throttle_min;
         const double hi=c.throttle_model=="quadratic" ? c.throttle_max*c.throttle_max : c.throttle_max;
-        if((raw>=lo && raw<=hi) || (raw>hi && energy<0) || (raw<lo && energy>0)) ei=candidate;
-        out.throttle=std::clamp(raw,lo,hi);
+        // The integral has negative feedback: positive energy surplus reduces thrust.
+        if((raw>=lo && raw<=hi) || (raw>hi && energy>0) || (raw<lo && energy<0)) ei=candidate;
+        // A rejected candidate must not affect this cycle's command.
+        out.throttle=std::clamp(thrust_fraction(ei),lo,hi);
         if(c.throttle_model=="quadratic") out.throttle=std::sqrt(out.throttle);
         out.pitch=std::clamp(hdot/c.speed+pi(balance,dt,bi,c.kpB,c.kiB,c.pitch_min,c.pitch_max),c.pitch_min,c.pitch_max);
         const double hnorm=h.head<2>().norm();

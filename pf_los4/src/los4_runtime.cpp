@@ -59,16 +59,6 @@ Runtime::Runtime(Config config,std::shared_ptr<mavsdk::System> system):c(std::mo
             d.kill_valid=k<=v.chancount && kill_pwm>=800 && kill_pwm<=2200 && v.rssi!=0;
             d.kill=!d.kill_valid || (config_copy.kill_active_high ?
                 kill_pwm>=config_copy.kill_threshold : kill_pwm<=config_copy.kill_threshold);
-        } else if(m.msgid==MAVLINK_MSG_ID_VFR_HUD) {
-            mavlink_vfr_hud_t v{};mavlink_msg_vfr_hud_decode(&m,&v);
-            d.air_data.calibrated=v.airspeed;d.air_data.air_time=t;
-        } else if(m.msgid==MAVLINK_MSG_ID_HIGHRES_IMU) {
-            mavlink_highres_imu_t v{};mavlink_msg_highres_imu_decode(&m,&v);
-            // Only refreshed pressure/ambient-temperature fields count as fresh.
-            if((v.fields_updated & (1<<9)) && (v.fields_updated & (1<<12))) {
-                d.air_data.pressure_pa=v.abs_pressure*100.0;d.air_data.temperature_c=v.temperature;
-                d.air_data.pressure_time=t;
-            }
         } else if(m.msgid==MAVLINK_MSG_ID_SYS_STATUS) {
             mavlink_sys_status_t v{};mavlink_msg_sys_status_decode(&m,&v);
             constexpr uint32_t bit=MAV_SYS_STATUS_SENSOR_DIFFERENTIAL_PRESSURE;
@@ -88,13 +78,24 @@ Runtime::Runtime(Config config,std::shared_ptr<mavsdk::System> system):c(std::mo
     };
     for(const uint16_t id : {MAVLINK_MSG_ID_HEARTBEAT,MAVLINK_MSG_ID_EXTENDED_SYS_STATE,
         MAVLINK_MSG_ID_LOCAL_POSITION_NED,MAVLINK_MSG_ID_ATTITUDE,MAVLINK_MSG_ID_RC_CHANNELS,MAVLINK_MSG_ID_COMMAND_ACK,
-        MAVLINK_MSG_ID_VFR_HUD,MAVLINK_MSG_ID_HIGHRES_IMU,MAVLINK_MSG_ID_SYS_STATUS,MAVLINK_MSG_ID_WIND_COV})
+        MAVLINK_MSG_ID_SYS_STATUS,MAVLINK_MSG_ID_WIND_COV})
         handles.emplace_back(id,link->subscribe_message(id,callback));
+    // Use MAVSDK's receiving API. PX4 supplies CAS in VFR_HUD. The
+    // shared cache remains alive if a queued callback runs during shutdown.
+    telemetry=std::make_unique<mavsdk::Telemetry>(system);
+    airspeed_handle=telemetry->subscribe_fixedwing_metrics([shared,origin](mavsdk::Telemetry::FixedwingMetrics value) {
+        std::lock_guard<std::mutex> lock(shared->mutex);
+        shared->data.air_data.calibrated=value.airspeed_m_s;
+        shared->data.air_data.air_time=std::chrono::duration<double>(Clock::now()-origin).count();
+    });
+    const auto airspeed_rate=telemetry->set_rate_fixedwing_metrics(10);
+    if(airspeed_rate!=mavsdk::Telemetry::Result::Success)
+        std::cerr<<"Airspeed rate request failed: "<<airspeed_rate<<"; subscription remains active\n";
     // Request safety streams once; no arm/takeoff command exists in this program.
     for(const auto& pair : {std::pair<int,double>{MAVLINK_MSG_ID_EXTENDED_SYS_STATE,5},
                           {MAVLINK_MSG_ID_RC_CHANNELS,10},{MAVLINK_MSG_ID_LOCAL_POSITION_NED,20},
-                          {MAVLINK_MSG_ID_ATTITUDE,20},{MAVLINK_MSG_ID_VFR_HUD,10},
-                          {MAVLINK_MSG_ID_HIGHRES_IMU,10},{MAVLINK_MSG_ID_SYS_STATUS,2},
+                          {MAVLINK_MSG_ID_ATTITUDE,20},
+                          {MAVLINK_MSG_ID_SYS_STATUS,2},
                           {MAVLINK_MSG_ID_WIND_COV,5}}) {
         link->queue_message([pair,target_sys,target_comp](auto address,uint8_t channel) {
             mavlink_message_t msg{};
@@ -105,7 +106,10 @@ Runtime::Runtime(Config config,std::shared_ptr<mavsdk::System> system):c(std::mo
         });
     }
 }
-Runtime::~Runtime() {if(link)for(const auto& h:handles)link->unsubscribe_message(h.first,h.second);}
+Runtime::~Runtime() {
+    if(telemetry)telemetry->unsubscribe_fixedwing_metrics(airspeed_handle);
+    if(link)for(const auto& h:handles)link->unsubscribe_message(h.first,h.second);
+}
 bool Runtime::mode_request(int mode) {
     if(!link || !c.enabled || c.test || mode==0 || mode==6)return false;
     const auto sys=link->get_target_sysid(),comp=link->get_target_compid();
@@ -172,7 +176,8 @@ void Runtime::diagnostics(double t) {
             d.v.head<2>(),c.speed,d.air_data.wind);
         compensation=std::isfinite(acceleration)?1:2;
     }
-    send({1,3,float(c.wind),float(air_valid?d.air_data.true_airspeed():NAN),
+    // Environment v2: slot 3 (old derived TAS) is unavailable; CAS remains slot 4.
+    send({2,3,float(c.wind),NAN,
           float(d.air_data.calibrated),float(d.air_data.wind.x()),float(d.air_data.wind.y()),
           float(d.air_data.air_age(t)),float(t-d.air_data.wind_time),float(air_valid),float(wind_valid),float(compensation)});
     Output output=latest;
@@ -190,7 +195,7 @@ void Runtime::diagnostics(double t) {
         try {
             auto config=c;config.gamma0=output.gamma;Los4 shadow(config);
             const auto preview=shadow.step(1/c.rate,d.p,d.v,d.eta,
-                d.air_data.air_valid(t)?d.air_data.true_airspeed():NAN,d.air_data.wind,d.air_data.wind_valid(t));
+                d.air_data.air_valid(t)?d.air_data.calibrated:NAN,d.air_data.wind,d.air_data.wind_valid(t));
             output.roll=preview.roll;output.pitch=preview.pitch;output.heading=preview.heading;flags|=8;
         } catch(const std::exception&) {} // No reference if speed/geometry is unsuitable.
     }
@@ -232,8 +237,8 @@ void Runtime::tick() {
                     latest=Output{};latest.gamma=c.gamma0;
                     const auto point=path_point(c,c.gamma0);
                     latest.pd=point.p;latest.derivative=point.d1;
-                } else if(safety.phase==Phase::Active)latest=controller.step(dt,d.p,d.v,d.eta,d.air_data.true_airspeed(),d.air_data.wind,d.air_data.wind_valid(t));
-                else {auto preview=controller;latest=preview.step(1/c.rate,d.p,d.v,d.eta,d.air_data.true_airspeed(),d.air_data.wind,d.air_data.wind_valid(t));latest.gamma_dot=0;}
+                } else if(safety.phase==Phase::Active)latest=controller.step(dt,d.p,d.v,d.eta,d.air_data.calibrated,d.air_data.wind,d.air_data.wind_valid(t));
+                else {auto preview=controller;latest=preview.step(1/c.rate,d.p,d.v,d.eta,d.air_data.calibrated,d.air_data.wind,d.air_data.wind_valid(t));latest.gamma_dot=0;}
                 have_output=true;
                 if(!send_setpoint(latest))throw std::runtime_error("Setpoint could not be queued");
             }
@@ -260,7 +265,7 @@ void Runtime::tick() {
             <<" pd_NED=["<<latest.pd.transpose()<<"] ep_norm="<<latest.ep_norm;
         if(c.wind) {
             Data d;{std::lock_guard<std::mutex> lock(cache->mutex);d=cache->data;}
-            std::cout<<" TAS="<<(d.air_data.air_valid(t)?d.air_data.true_airspeed():NAN)
+            std::cout<<" CAS="<<(d.air_data.air_valid(t)?d.air_data.calibrated:NAN)
                      <<" airspeed_valid="<<d.air_data.air_valid(t)<<" wind_valid="<<d.air_data.wind_valid(t)
                      <<" wind_NE=["<<d.air_data.wind.transpose()<<"]";
         }

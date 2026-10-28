@@ -16,11 +16,11 @@ struct Config {
     bool kill_active_high=true;
     double radius=150, scale=200, speed=20, gamma0=0, rate=50, stale=0.5;
     Eigen::Vector3d p0{0,0,-30}, p1{200,0,-30}, center{0,0,-25};
-    double mass=1.48, tmax=104.720105;
+    double mass=1.48, tmax=20;
     double k1=1, k2=20, kpE=0.05, kiE=0.005, kpB=0.002, kiB=0.00001;
     double ka=10, kphi=10, ktheta=10;
     double throttle_min=0, throttle_max=1, pitch_min=-0.52, pitch_max=0.52;
-    double accel_min=-10, accel_max=10, rate_limit=1.5, min_speed=5;
+    double accel_min=-10, accel_max=10, rate_limit=1.5, min_speed=1;
 };
 inline double number(const std::string& s) {
     std::size_t used=0;

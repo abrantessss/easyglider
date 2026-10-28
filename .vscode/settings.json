@@ -80,6 +80,6 @@
         "/opt/ros/humble/lib/python3.10/site-packages",
         "/opt/ros/humble/local/lib/python3.10/dist-packages"
     ],
-    "cmake.sourceDirectory": "/home/fil2k/MAVSDK/CAPTURE/main",
+    "cmake.sourceDirectory": "/home/abrantess/easyglider/pf_los4",
     "ROS2.distro": "humble"
 }

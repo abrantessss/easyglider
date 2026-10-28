@@ -3,6 +3,7 @@
 #include "los4_air_data.hpp"
 #include "los4_safety.hpp"
 #include <mavsdk/plugins/mavlink_passthrough/mavlink_passthrough.h>
+#include <mavsdk/plugins/telemetry/telemetry.h>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,8 @@ class Runtime {
     Safety safety;
     std::shared_ptr<Cache> cache=std::make_shared<Cache>();
     std::unique_ptr<mavsdk::MavlinkPassthrough> link;
+    std::unique_ptr<mavsdk::Telemetry> telemetry;
+    mavsdk::Telemetry::FixedwingMetricsHandle airspeed_handle;
     std::vector<std::pair<uint16_t,mavsdk::MavlinkPassthrough::MessageHandle>> handles;
     Clock::time_point epoch=Clock::now(),last_tick=epoch;
     double last_return=-100,last_print=-100,handback_started=-100,last_diagnostic=-100,last_config=-100;
